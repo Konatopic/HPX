@@ -1,23 +1,26 @@
 // ==UserScript==
 // @name         Homophone Explorer
 // @namespace    com.konatopic.hpx
-// @version      0.5.4b
+// @version      0.6.0b
 // @description  Finds Japanese homophones on each vocabulary page on Wanikani.com
 // @author       Konatopic
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @include      /^http(s)?://www\.wanikani\.com/vocabulary//
 // @include      /^http(s)?://www\.wanikani\.com/level/[0-9]+/vocabulary//
-// ==/UserScript==
 
+// ==/UserScript==
+// @include      /^http(s)?://www\.wanikani\.com/lesson/session/
+// @include      /^http(s)?://www\.wanikani\.com/review/session/
 // =============================== CONSTANTS =================================== //
 
 var MAX_LEVEL = 60; // as of this version
-var KEY_NAMES = { // names of entries as stored by HPX in storage
+var KEY_NAMES = { // names of entries as stored by HPX in storage - best not to change these after first use
     API_KEY:'APIKey',
     DATA:'data',
     USER_SETTINGS:'userSettings',
-    LAST_UPDATED:'lastUpdated'
+    LAST_UPDATED:'lastUpdated',
+    UPDATING: 'updating'
 };
 var SETTINGS_URL = 'https://www.wanikani.com/account';
 var API_VERSION = "v1.4"; // built with version 1.4
@@ -75,24 +78,10 @@ function HPX(){
     // find out the vocab whose reading will be compared to
     getComparisonVocab();
 
-    // Load previous vocab lists if available and display then while we update (if necessary)
-    (function(){
-        var response = loadListFromLocal();
-        if(response){ // data present
+    // Load previous data if available and display then while we update (if necessary)
+    loadDataFromLocal();
 
-            lastUpdated = response[KEY_NAMES.LAST_UPDATED];
-            userInformation = response[KEY_NAMES.DATA].user_information;
-            vocabList = response[KEY_NAMES.DATA].requested_information;
-
-            // present something to the user first
-            getComparisonReadings();
-            createHomophoneList();
-
-            console.log('Displaying homophones from cache');
-            ui.displayHomophones(homophones);
-        }
-    })();
-
+    // set UI Status to IDLE
     ui.setStatus('IDLE');
 
     // Let's look for the API Key
@@ -101,9 +90,11 @@ function HPX(){
         if(typeof key === 'string'){
             // returned valid key
             APIKey = key;
-            autoUpdate();
+            autoUpdate(); // only call function once!!
         } else {
-            console.log('Cannot find API Key anywhere. Please manually enter your by executing "localStorage.setItem(\''+ commonAPIKeyNames[0] +'\', API_KEY);" in your developer console while on any wanikani.com page, where API_KEY is your 32 character API Key. Please report this to the developer.');
+            console.log('Cannot find API Key anywhere. Please manually enter your by executing "localStorage.setItem(\''+
+                        commonAPIKeyNames[0] +
+                        '\', API_KEY);" in your developer console while on any wanikani.com page, where API_KEY is your 32 character API Key. Please report this to the developer.');
             ui.setStatus('SEARCH_FOR_KEY_FAILED');
         }
     });
@@ -111,63 +102,127 @@ function HPX(){
     // schedules updates
     function autoUpdate(){
 
+        var _lastUpdated = getLastUpdated(),
+            timeSinceUpdate,
+            timeUntilUpdate,
+            randomTime;
+
         ui.setStatus('IDLE');
 
-        if(typeof lastUpdated === 'number'){
-            var timeSinceUpdate = new Date().getTime() - lastUpdated;
-            var timeUntilUpdate;
+        // add Math.random time to the scheduled update - javascript Chrome and Firefox extensions are probably single threaded but just to make sure
+        // this is so that when more than one injected tab is open, they do not all update at the same time
+        randomTime = Math.random() * 10000; // U(0,lim->10) seconds
 
+        // set these two variables first
+        if(typeof _lastUpdated === 'number'){
+            timeSinceUpdate = new Date().getTime() - _lastUpdated;
+            timeUntilUpdate = minUpdateInterval * 60 * 1000 - timeSinceUpdate + randomTime;
+        }
+
+        // only allow server updates on active tab
+        if (pageIsHidden()){
+            if(typeof _lastUpdated === 'number'){
+                if(timeSinceUpdate < minUpdateInterval * 60 * 1000 && timeSinceUpdate >= 0){
+                    loadDataFromLocal(); // but do allow it to do a local update
+                    console.log('Scheduled autoUpdate in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
+                    return setTimeout(function(){autoUpdate();},timeUntilUpdate); // and schedule an autoupdate as if it were an active tab
+                }
+            }
+            console.log('Scheduled autoUpdate in 15 seconds.');
+            return setTimeout(function(){autoUpdate();},15000); // try again in 15 seconds
+        }
+
+        // else in the active tab, schedule is a server update
+        if(typeof _lastUpdated === 'number'){
             if(timeSinceUpdate > minUpdateInterval * 60 * 1000){
                 // time for an update
                 update();
             } else {
-                timeUntilUpdate = minUpdateInterval * 60 * 1000 - timeSinceUpdate;
                 if(timeUntilUpdate > 2147483647){
                     // some funny business huh? - the user probably doesn't want to stick around for 24.8 days for page to update
                     update();
                 } else {
                     // schedule update
-                    console.log('Scheduled update in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
-                    setTimeout(function(){update();},timeUntilUpdate);
+                    console.log('Scheduled autoUpdate in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
+                    setTimeout(function(){autoUpdate();},timeUntilUpdate);
+
+                    // reload from cache because another instance of HPX could have updated the cache
+                    loadDataFromLocal();
                 }
             }
         } else {
+
             // first run
             update();
+
+        }
+
+        // updates from server immediately and sets up autoUpdate()
+        function update(){
+
+            // It turns out this doesn't prevent multiple tabs from updating simultaneously if they load in close succession
+            if(!isUpdating()){
+                setUpdatingFlag(true);
+            }else{
+                // try again in 15 seconds
+                setTimeout(function(){autoUpdate();},15000);
+                ui.setStatus('UPDATING_OTHER_INSTANCE');
+                console.log("Update queued. Retrying in 15 seconds");
+                return;
+            }
+
+            console.log('Updating');
+            ui.setStatus('UPDATING');
+
+
+            loadListFromServer(function(success,data){
+
+                setUpdatingFlag(false);
+
+                if(success){
+
+                    userInformation = data.user_information;
+                    vocabList = data.requested_information;
+                    getComparisonReadings();
+                    createHomophoneList();
+
+                    console.log('Displaying homophones from refresh');
+                    ui.displayHomophones(homophones);
+
+                    // update lastUpdated
+                    lastUpdated = new Date().getTime();
+
+                    // schedule next update
+                    autoUpdate();
+
+                } else {
+                    console.log('Problem connecting to server',data);
+                }
+
+                ui.setStatus('IDLE');
+            });
+
+            // Sets the KEY_NAMES.UPDATING flag in GM_setValue to prevent other HPX instances from updating
+            // bool updating true when updating, else false
+            function setUpdatingFlag(updating){
+                GM_setValue(KEY_NAMES.UPDATING,updating);
+            }
+
+        }
+
+        // checks GM_getValue for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
+        function isUpdating(){
+            var updating = GM_getValue(KEY_NAMES.UPDATING);
+            console.log(typeof updating,(typeof updating !== 'undefined' ? updating:undefined));
+            return (typeof updating !== 'undefined' ? updating:false); // return updating status or false during first run
         }
 
     }
 
-    // updates from server immediately and sets up autoUpdate()
-    function update(){
-
-        console.log('Updating');
-        ui.setStatus('UPDATING');
-
-        loadListFromServer(function(success,data){
-
-            if(success){
-
-                userInformation = data.user_information;
-                vocabList = data.requested_information;
-                getComparisonReadings();
-                createHomophoneList();
-
-                console.log('Displaying homophones from refresh');
-                ui.displayHomophones(homophones);
-
-                // update lastUpdated
-                lastUpdated = new Date().getTime();
-
-                // schedule next update
-                autoUpdate();
-
-            } else {
-                console.log('Problem connecting to server',data);
-            }
-
-            ui.setStatus('IDLE');
-        });
+    // returns lastUpdated from GM_getValue
+    function getLastUpdated(){
+        var _lastUpdated = GM_getValue(KEY_NAMES.LAST_UPDATED);
+        return (typeof _lastUpdated !== 'undefined' ? _lastUpdated:undefined); // return time lastUpdated or undefined during first run
     }
 
     // get the vocab of the current page from url
@@ -250,21 +305,30 @@ function HPX(){
         }
     }
 
-    // get json locally if available
-    // returns {lastUpdated,data} if available, else null
-    function loadListFromLocal(){
+    // update data and class variables from cache
+    // returns true if available, else false
+    function loadDataFromLocal(){
         var _lastUpdated, _data;
         var obj = {};
 
-        _lastUpdated = GM_getValue(KEY_NAMES.LAST_UPDATED);
+        _lastUpdated = getLastUpdated();
         _data = GM_getValue(KEY_NAMES.DATA);
 
         if(typeof _data === 'undefined' || typeof _lastUpdated === 'undefined'){
             return false;
         } else {
-            obj[KEY_NAMES.LAST_UPDATED] = _lastUpdated;
-            obj[KEY_NAMES.DATA] = JSON.parse(_data);
-            return obj;
+
+            lastUpdated = _lastUpdated; // global variable
+            userInformation = JSON.parse(_data).user_information; // hpx variable
+            vocabList = JSON.parse(_data).requested_information; // hpx variable
+
+            // present something to the user first
+            getComparisonReadings();
+            createHomophoneList();
+
+            console.log('Displaying homophones from cache');
+            ui.displayHomophones(homophones);
+            return true;
         }
 
     }
@@ -458,6 +522,7 @@ function UI(){
         SEARCHING_FOR_KEY: 'Looking for your API Key.',
         SEARCH_FOR_KEY_FAILED:'Cannot find your API Key. Please try again later.',
         UPDATING: 'Updating cache with Wanikani servers. Please stay on the page...', // API Servers
+        UPDATING_OTHER_INSTANCE: 'Updating cache on another instance.'
     };
 
 
@@ -663,4 +728,26 @@ function GM_clearValues(){
         GM_deleteValue(keys[i]);
         console.log('Deleted ' + keys[i]);
     }
+}
+
+// http://www.html5rocks.com/en/tutorials/pagevisibility/intro/
+function pageIsHidden(){
+    var prefixes = ['webkit','moz','ms','o'];
+    var property;
+
+    // if 'hidden' is natively supported just return it
+    if ('hidden' in document){
+        property = 'hidden';
+    } else {
+        // otherwise loop over all the known prefixes until we find one
+        for (var i = 0; i < prefixes.length; i++){
+            if ((prefixes[i] + 'Hidden') in document){
+                property = prefixes[i] + 'Hidden';
+            }
+        }
+    }
+    // otherwise hidden is not supported
+
+    return (typeof document[property] !== 'undefined' ? document[property] : false);
+
 }

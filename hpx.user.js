@@ -641,6 +641,19 @@ function UI(){
     this.setStatus('INIT');
 }
 
+function UISession(){
+
+    // hook jQuery.fn.show()
+    function hookShow(){
+        $.fn._show_hpx = $.fn.show;
+        $.fn.show = function(a,b,c){
+            res = $.fn._show_hpx.call(this,a,b,c);
+
+            return res;
+        };
+    }
+}
+
 // Attempts to find API Key in GM_getValue, localStorage and wanikani.com in that order
 // bool forceRemote - flag to skip local search
 // function(key) callback - callback function after ajax function calls back

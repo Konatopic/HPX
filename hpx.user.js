@@ -1,22 +1,22 @@
 // ==UserScript==
 // @name         Homophone Explorer
 // @namespace    com.konatopic.hpx
-// @version      0.6.2b
+// @version      0.7.0b
 // @description  Finds Japanese homophones on each vocabulary page on Wanikani.com
 // @author       Konatopic
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @include      /^http(s)?://www\.wanikani\.com/vocabulary//
 // @include      /^http(s)?://www\.wanikani\.com/level/[0-9]+/vocabulary//
-
+// @include      /^http(s)?://www\.wanikani\.com/review/session/
 // ==/UserScript==
 
 // TODOs #########################################################
-// support for lesson and review pages
+// support for lesson pages
 // support for free accounts - check for {error}
 
 // @include      /^http(s)?://www\.wanikani\.com/lesson/session/
-// @include      /^http(s)?://www\.wanikani\.com/review/session/
+
 // =============================== CONSTANTS =================================== //
 var MAX_LEVEL = 60; // as of this version
 var KEY_NAMES = { // names of entries as stored by HPX in storage - best not to change these after first use
@@ -33,7 +33,7 @@ var API_REQUEST_TEMPLATE = {
 
 // =============================== GLOBALS ====================================== //
 
-var minUpdateInterval = 30; // minimum time between each automatic refresh in minutes
+var minUpdateInterval = 60;// minimum time between each automatic refresh in minutes
 var lastUpdated;
 
 // Some common names for the API Key variable defined some other script authors
@@ -60,7 +60,8 @@ function HPX(){
     console.log('HPX initializing; Using jQuery version: ' + jQuery.fn.jquery + '. Caution: minified library may be incomplete');
 
     var APIKey,
-        updating = false; // if this instance is updating
+        thisUpdating = false, // if this instance is updating
+        updateTimeoutID = 0.1; // setTimeout only returns integers
 
     var vocabDB, // from API_REQUEST_TEMPLATE.VOCAB_LIST
         requestedLevels;
@@ -78,7 +79,7 @@ function HPX(){
 
     // Clean up if user navigates away
     window.onbeforeunload = function(e){
-        if(updating){
+        if(thisUpdating){
             setUpdatingFlag(false);
         }
     };
@@ -86,18 +87,25 @@ function HPX(){
     // Load previous data if available
     loadDataFromLocal();
 
-    // set up to listen for a new comparison vocab
-    $(document).on("HPX:vocabUpdate",function(e,data){
+    // set up to listener for a new comparison vocab & reload
+    $(document).on('HPX:vocabUpdate',function(e,data){
         if(data && data.exists){
             comparisonVocab = data.comparisonVocab;
             createHomophoneList();
             ui.displayHomophones(homophones);
         }
         return false;
+    }).on('HPX:reloadRequest',function(e){
+        // only allow force request after an autoUpdate has been called previously
+        if(Number.isInteger(updateTimeoutID)){
+            clearTimeout(updateTimeoutID);
+            update(true);
+        }
+        return false;
     });
 
     // Setup UI
-    if($(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/lesson\/session/) === 0 ||
+    if($(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/review\/session/) === 0 ||
        $(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/lesson\/session/) === 0){
         ui = new UISessionPage();
     } else {
@@ -124,7 +132,7 @@ function HPX(){
     });
 
     // schedules updates
-    function autoUpdate(){
+    function autoUpdate(forceUpdate){
 
         var _lastUpdated = getLastUpdated(),
             timeSinceUpdate,
@@ -147,11 +155,11 @@ function HPX(){
                 if(timeSinceUpdate < minUpdateInterval * 60 * 1000 && timeSinceUpdate >= 0){
                     localCreateAndDisplay(); // but do allow it to do a local update
                     console.log('Scheduled autoUpdate in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
-                    return setTimeout(function(){autoUpdate();},timeUntilUpdate); // and schedule an autoupdate as if it were an active tab
+                    return (updateTimeoutID = setTimeout(function(){autoUpdate();},timeUntilUpdate)); // and schedule an autoupdate as if it were an active tab
                 }
             }
             console.log('Scheduled autoUpdate in 3 seconds.');
-            return setTimeout(function(){autoUpdate();},3000); // try again in 3 seconds
+            return (updateTimeoutID = setTimeout(function(){autoUpdate();},3000)); // try again in 3 seconds
         }
 
         // else in the active tab, schedule is a server update
@@ -166,7 +174,7 @@ function HPX(){
                 } else {
                     // schedule update
                     console.log('Scheduled autoUpdate in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
-                    setTimeout(function(){autoUpdate();},timeUntilUpdate);
+                    updateTimeoutID = setTimeout(function(){autoUpdate();},timeUntilUpdate);
 
                     // reload from cache because another instance of HPX could have updated the cache
                     localCreateAndDisplay();
@@ -179,64 +187,66 @@ function HPX(){
 
         }
 
-        // updates from server immediately and sets up autoUpdate()
-        function update(){
+    }
 
-            // It turns out this doesn't prevent multiple tabs from updating simultaneously if they load in close succession
-            if(!isUpdating()){
-                setUpdatingFlag(true);
-            }else{
-                // try again in 3 seconds
-                setTimeout(function(){autoUpdate();},3000);
-                ui.setStatus('UPDATING_OTHER_INSTANCE');
-                console.log("Update queued. Retrying in 3 seconds");
-                return;
+    // checks sessionStorage for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
+    function isUpdating(){
+        var res = sessionStorage.getItem('HPX');
+        return (res !== null && JSON.parse(res).updating) ? true : false; // return updating status or false during first run
+    }
+
+    // updates from server immediately and sets up autoUpdate()
+    function update(forceReload){
+
+        if(thisUpdating){
+            return; // already updating in this instance
+        } else if(isUpdating() && !(typeof forceReload === 'boolean' && forceReload)){
+            // try again in 3 seconds
+            updateTimeoutID = setTimeout(function(){autoUpdate();},3000);
+            ui.setStatus('UPDATING_OTHER_INSTANCE');
+            console.log("Update queued. Retrying in 3 seconds");
+            return;
+        }
+
+        setUpdatingFlag(true);
+        ui.setStatus('UPDATING');
+        ui.toggleResetButton(false);
+
+        loadListFromServer(function(success,data){
+
+            ui.toggleResetButton(true);
+            setUpdatingFlag(false);
+
+            if(success){
+
+                userInformation = data.user_information;
+                vocabList = data.requested_information;
+
+                console.log('Updated cache');
+
+                // update lastUpdated
+                lastUpdated = new Date().getTime();
+
+                // schedule next update
+                autoUpdate();
+
+                ui.setStatus('IDLE');
+            } else {
+                console.log(data);
+                console.log('Problem connecting to server. Retrying in 3 seconds');
+                // schedule next update in 3 seconds
+                updateTimeoutID = setTimeout(function(){autoUpdate();},3000);
+
+                ui.setStatus('CONNECTION_ERROR');
             }
 
-            ui.setStatus('UPDATING');
-
-            loadListFromServer(function(success,data){
-
-                setUpdatingFlag(false);
-
-                if(success){
-
-                    userInformation = data.user_information;
-                    vocabList = data.requested_information;
-
-                    console.log('Updated cache');
-
-                    // update lastUpdated
-                    lastUpdated = new Date().getTime();
-
-                    // schedule next update
-                    autoUpdate();
-
-                    ui.setStatus('IDLE');
-                } else {
-                    console.log(data);
-                    console.log('Problem connecting to server. Retrying in 3 seconds');
-                    // schedule next update in 3 seconds
-                    setTimeout(function(){autoUpdate();},3000);
-
-                    ui.setStatus('CONNECTION_ERROR');
-                }
-
-            });
-
-        }
-
-        // checks sessionStorage for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
-        function isUpdating(){
-            var res = sessionStorage.getItem('HPX');
-            return (res !== null && JSON.parse(res).updating) ? true : false; // return updating status or false during first run
-        }
+        });
 
     }
 
     // Sets HPX.updating flag in sessionStorage to prevent other HPX instances from updating
     function setUpdatingFlag(_updating){
-        updating = _updating;
+        thisUpdating = _updating;
         sessionStorage.setItem('HPX',JSON.stringify({updating:_updating}));
     }
 
@@ -252,14 +262,12 @@ function HPX(){
         return (typeof _lastUpdated !== 'undefined' ? _lastUpdated:undefined); // return time lastUpdated or undefined during first run
     }
 
-
-
     // finds the reading for the current vocab - don't really trust the reading on the page - the layout could've been altered by other scripts
     function getComparisonReadings(){
         for (var i = 0;i < vocabList.length; i++){
             if(vocabList[i].character === comparisonVocab){
                 comparisonReadings = splitReadings(vocabList[i].kana);
-                console.log('Found ' + comparisonReadings.length + ' comparison readings found for ' + comparisonVocab);
+                console.log('Found ' + comparisonReadings.length + ' comparison readings found for ' + comparisonVocab + ': "'+vocabList[i].kana+'"');
                 return;
             }
         }
@@ -298,8 +306,7 @@ function HPX(){
                 // compare all comparison readings with each reading of the current vocab
                 for (var i = 0; i < currentReadings.length; i++){
                     if(currentReadings[i] === comparisonReadings[comparisonIndex]){
-                        // found one
-                        console.log('Found homophone: ' + vocabList[vocabIndex].character);
+                        // found one - probably if it's not the same as the comparison
                         homophones[comparisonIndex].vocabs.push(vocabList[vocabIndex]);
                     }
                 }
@@ -493,15 +500,15 @@ function UIPage(){
 
     var elements = {}; // jQuery object DOM elements
 
-    var lastViewUpdate = new Date().getTime();
     var timeoutID;
 
     var currentStatus;
-    this.statuses = {
+    var statuses = {
         INIT:function(){
             getComparisonVocab();
             return 'Initiatizing';
         },
+
         IDLE:function(){
             var time,days,hours,mins,secs;
             var strTime = 'Last updated: ';
@@ -539,35 +546,58 @@ function UIPage(){
             return strTime;
         },
         SEARCHING_FOR_KEY: 'Looking for your API Key.',
+
         SEARCH_FOR_KEY_FAILED:'Cannot find your API Key. Please try again later.',
-        CONNECTION_ERROR: function(){
-            setTimeout(function(){this.setStatus('IDLE');},2000); // go back to idle after 2 seconds of displaying error message
+
+        CONNECTION_ERROR: function(){ // go back to idle after 2 seconds of displaying error message
+            setTimeout(function(){
+                if(currentStatus === 'CONNECTION_ERROR'){
+                    this.setStatus('IDLE');
+                }
+            }.bind(this),2000);
             return 'Connection error... Retrying momentarily';
         },
         UPDATING: 'Updating cache with Wanikani servers. Please stay on the page...', // API Servers
+
         UPDATING_OTHER_INSTANCE: 'Updating cache on another instance.'
     };
 
     // build UI layout hierarchy
     // using Wanikani's .kotaba-table-list to display the vocab
-    elements.hpxSection = $('<section>',{id:'hpx-ui',class:'kotoba-table-list'});
+    elements.hpxSection = $('<section>',{id:'hpx-ui','class':'kotoba-table-list'});
     $('.vocabulary-reading').after(elements.hpxSection);
+
+    elements.infoResetHolder = $('<div>');
 
     // section title/heading
     elements.heading = $('<h2>',{text:'Homophones'});
 
     // info h4
-    elements.info = $('<h4>',{class:'small-caps',text:''});
+    elements.info = $('<h4>',{'class':'small-caps',text:''});
+    elements.info.css('display','inline-block');
+
+    // reset button
+
+    elements.reset = $('<a>',{'class':'btn btn-mini'});
+    elements.reset.text('Update cache now');
+    elements.reset.css('float','right');
+    elements.reset.on('click',function(){
+        $(document).trigger('HPX:reloadRequest');
+    });
 
     // ul
-    elements.ul = $('<ul>',{class:'multi-character-grid'});
+    elements.ul = $('<ul>',{'class':'multi-character-grid'});
 
     // display p when no homophones found
     elements.noHomophones = $('<p>',{text:'No homophones founds'});
 
+    elements.infoResetHolder
+        .append(elements.info)
+        .append(elements.reset);
+
     elements.hpxSection
         .append(elements.heading)
-        .append(elements.info)
+        .append(elements.infoResetHolder)
         .append(elements.ul);
 
     // build the list layout
@@ -587,23 +617,10 @@ function UIPage(){
 
             for (var i = 0; i < homophones[readingsIndex].vocabs.length; i++){
 
-                // time to create that item - has this structure
-                /*
-                * <li class="character-item {EXTRA_CLASSES}" id="vocabulary-{CHARACTER}">
-				*	<span lang="ja" class="item-badge"></span>
-				*	<a href="/vocabulary/{URLENCODED_CHARACTER}">
-				*		<span class="character" lang="ja">{CHARACTER}</span>
-				*		<ul>
-				*			<li lang="ja">{READING}</li>
-				*			<li>{MEANING}</li>
-				*		</ul>
-				*	</a>
-				* </li>
-                */
+                // time to create list item for each item
+                t.liWrapper = $('<li>',{'class':'character-item', id:'vocabulary-' + homophones[readingsIndex].vocabs[i].character});
 
-                t.liWrapper = $('<li>',{class:'character-item', id:'vocabulary-' + homophones[readingsIndex].vocabs[i].character});
-
-                // set {EXTRA_CLASSES}
+                // set classes
                 if(homophones[readingsIndex].vocabs[i].user_specific === null){
                     // locked
                     t.liWrapper.addClass('locked');
@@ -612,9 +629,9 @@ function UIPage(){
                     t.liWrapper.addClass('burned');
                 }
 
-                t.spanItemBadge = $('<span>',{class:'item-badge', lang:'ja'});
+                t.spanItemBadge = $('<span>',{'class':'item-badge', lang:'ja'});
                 t.anchor = $('<a>',{href:'/vocabulary/'+encodeURIComponent(homophones[readingsIndex].vocabs[i].character)});
-                t.spanCharacter = $('<span>',{class:'character', lang:'ja', text:homophones[readingsIndex].vocabs[i].character});
+                t.spanCharacter = $('<span>',{'class':'character', lang:'ja', text:homophones[readingsIndex].vocabs[i].character});
                 t.ulWrapper = $('<ul>');
                 t.liReading = $('<li>',{lang:'ja', text:homophones[readingsIndex].vocabs[i].kana});
                 t.liMeaning = $('<li>',{text:homophones[readingsIndex].vocabs[i].meaning});
@@ -640,32 +657,43 @@ function UIPage(){
         }
     };
 
+
+    this.toggleResetButton = function(state){
+
+        if (typeof state === 'boolean'){
+            if(state){
+                elements.reset.removeAttr('disabled');
+            }
+            else {
+                elements.reset.attr('disabled','disabled');
+            }
+        }
+    };
+
     // public function that allows the view to be set
     // calls updateView() which updates the status text
     this.setStatus = function(state){
 
-        var thisContext = this;
-
         console.log(state);
-        if(thisContext.statuses.hasOwnProperty(state)){
+        if(statuses.hasOwnProperty(state)){
             currentStatus = state;
-            updateView();
+            updateView.call(this);
         }
 
         function updateView(){
             var res;
 
-            if(typeof thisContext.statuses[currentStatus] === 'function'){
-                res = thisContext.statuses[currentStatus]();
+            if(typeof statuses[currentStatus] === 'function'){
+                res = statuses[currentStatus].call(this);
             } else {
-                res = thisContext.statuses[currentStatus];
+                res = statuses[currentStatus];
             }
 
             if(typeof timeoutID != 'undefined'){
                 clearTimeout(timeoutID);
                 elements.info.text(res);
             }
-            timeoutID = setTimeout(function(){updateView();},1000);
+            timeoutID = setTimeout(function(){updateView(state);}.bind(this),1000);
         }
 
     };
@@ -701,22 +729,159 @@ function UIPage(){
 
 function UISessionPage(){
 
-    var comparisonVocab;
+    var elements = {}; // jQuery object DOM elements
+
+    var currentStatus;
+    var statuses = {
+        INIT:function(){
+            return 'Initiatizing';
+        },
+
+        IDLE:function(){
+            return '';
+        },
+
+        SEARCHING_FOR_KEY: 'Looking for your API Key.',
+
+        SEARCH_FOR_KEY_FAILED:'Cannot find your API Key. Please try again later.',
+
+        CONNECTION_ERROR: function(){
+            setTimeout(function(){
+                if(currentStatus === 'CONNECTION_ERROR'){
+                    this.setStatus('IDLE');
+                }
+            }.bind(this),2000);
+            return 'Connection error... Retrying momentarily';
+        },
+        UPDATING: 'Updating cache with Wanikani servers. Please stay on the page...',
+
+        UPDATING_OTHER_INSTANCE: 'Updating cache on another instance.'
+    };
+
+    elements.hpxSection = $('<section>',{id:'hpx-ui'});
+
+    // spacer
+    elements.spacer = $('<div>',{html:'&nbsp'});
+
+    // section title/heading
+    elements.heading = $('<h2>',{text:'Homophones'});
+
+    // ul
+    elements.ul = $('<ul>',{'class':'lattice-multi-character'});
+    elements.ul.css('padding-left','0');
+
+    // display p when no homophones found
+    elements.noHomophones = $('<p>',{text:'No homophones founds'});
+
+    elements.hpxSection
+        .append(elements.heading)
+        .append(elements.ul);
 
     // hook jQuery.fn.show()
-    $.fn._show_hpx = $.fn.show;
+    $.fn._hpx_show = $.fn.show;
     $.fn.show = function(a,b,c){
-        var res = $.fn._show_hpx.call(this,a,b,c);
+        var res = $.fn._hpx_show.call(this,a,b,c);
 
         // detect when Wanikani has loaded additional item information
         // ("#all-info").show() seems to correspond with this.
-        // Cannot just hook show() of just one instance as jQuery creates a new jQuery every time it's called and doesn't reuse jQuery objects as I had first thought
-        if(this[0].id === "all-info"){
+        if(typeof this[0] !== 'undefined' && this[0].id === 'information'){
+            // start of wanikani ajax request
 
+        } else if(typeof this[0] !== 'undefined' && this[0].id === 'all-info'){
+            // wanikani ajax request returns - does not fire with radicals
+            getComparisonVocab();
+        } else if (typeof this[0] === 'undefined'){
+            console.log(this); // i'm curious
         }
 
         return res;
     };
+
+    // build the list layout
+    this.displayHomophones = function(homophones){
+
+        var t = {};
+
+        // empty ul wrapper from previous renders
+        elements.ul.empty();
+
+        // add "no homophones found" if there were no homophones found
+        if (homophones.length < 1){
+            elements.ul.append(elements.noHomophones);
+        }
+
+        for (var readingsIndex = 0; readingsIndex < homophones.length; readingsIndex++){
+
+            for (var i = 0; i < homophones[readingsIndex].vocabs.length; i++){
+
+                t.liWrapper = $('<li>',{ id:'vocabulary-' + homophones[readingsIndex].vocabs[i].character});
+                t.anchor = $('<a>',{
+                    lang:'ja',
+                    href:'/vocabulary/'+encodeURIComponent(homophones[readingsIndex].vocabs[i].character),
+                    text:homophones[readingsIndex].vocabs[i].character
+                });
+
+                // append these elements appropriately
+                t.liWrapper.append(t.spanItemBadge)
+                    .append(t.anchor);
+
+                elements.ul.append(t.liWrapper);
+
+            }
+
+            // add a separator
+            if (readingsIndex < homophones.length - 1){
+                elements.ul.append($('<hr>'));
+            }
+        }
+
+        $('#item-info-reading')
+            .append(elements.spacer)
+            .append(elements.hpxSection);
+
+    };
+
+
+    this.toggleResetButton = function(state){};
+
+    // public function that allows the view to be set
+    // calls updateView() which updates the status text
+    this.setStatus = function(state){
+
+        console.log(state);
+        if(statuses.hasOwnProperty(state)){
+            currentStatus = state;
+            if(typeof statuses[currentStatus] === 'function'){
+                statuses[currentStatus].call(this);
+            }
+        }
+
+    };
+
+    // get the vocab of the current page from url
+    function getComparisonVocab(){
+        var comparisonVocab = $.jStorage.get("currentItem").voc ? $.jStorage.get("currentItem").voc : undefined; // only for vocab
+        console.log('Comparison vocab detected as ' + comparisonVocab);
+
+        if(comparisonVocab){
+            // trigger new HPX:vocabUpdate event
+            $(document).trigger('HPX:vocabUpdate',{
+                exists: true,
+                comparisonVocab: comparisonVocab
+            });
+        }
+    }
+
+    // some styles
+    $('head')
+        .append($('<style>',{type:'text/css'})
+                .html('.lattice-multi-character a {display: block;color:#fff; text-shadow: 0 1px 0 rgba(0,0,0,0.2); text-decoration: none; '+
+                      'box-shadow: 0 -2px 0 rgba(0,0,0,0.2) inset; transition: text-shadow ease-out 0.3s; padding-left: 0.4em; '+
+                      'padding-right: 0.4em; font-size: 13px; border-radius: 3px; background-color: #3f7fe9;}'+
+                      '.lattice-multi-character li{overflow-x:hidden; overflow-y:hidden; color: rgb(51, 51, 51); display:inline-block; '+
+                      'width: auto;height: 21px;margin-right: 2px;margin-bottom: 2px;line-height: 21px;text-align: center;}'+
+                      '.lattice-multi-character ul{margin-left: 0;margin-right: 0;}'));
+
 }
 
 // Attempts to find API Key in GM_getValue, localStorage and wanikani.com in that order

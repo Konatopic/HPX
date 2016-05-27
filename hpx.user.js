@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Homophone Explorer
 // @namespace    com.konatopic.hpx
-// @version      0.6.0b
+// @version      0.6.2b
 // @description  Finds Japanese homophones on each vocabulary page on Wanikani.com
 // @author       Konatopic
 // @grant        GM_setValue
@@ -10,31 +10,33 @@
 // @include      /^http(s)?://www\.wanikani\.com/level/[0-9]+/vocabulary//
 
 // ==/UserScript==
+
+// TODOs #########################################################
+// support for lesson and review pages
+// support for free accounts - check for {error}
+
 // @include      /^http(s)?://www\.wanikani\.com/lesson/session/
 // @include      /^http(s)?://www\.wanikani\.com/review/session/
 // =============================== CONSTANTS =================================== //
-
 var MAX_LEVEL = 60; // as of this version
 var KEY_NAMES = { // names of entries as stored by HPX in storage - best not to change these after first use
     API_KEY:'APIKey',
     DATA:'data',
     USER_SETTINGS:'userSettings',
-    LAST_UPDATED:'lastUpdated',
-    UPDATING: 'updating'
+    LAST_UPDATED:'lastUpdated'
 };
 var SETTINGS_URL = 'https://www.wanikani.com/account';
 var API_VERSION = "v1.4"; // built with version 1.4
+var API_REQUEST_TEMPLATE = {
+    VOCAB_LIST:'https://www.wanikani.com/api/{VERSION_NUMBER}/user/{USER_API_KEY}/vocabulary/{levels}'
+};
 
 // =============================== GLOBALS ====================================== //
 
 var minUpdateInterval = 30; // minimum time between each automatic refresh in minutes
 var lastUpdated;
-var APIRequestTemplate = {
-    vocabList:'https://www.wanikani.com/api/{VERSION_NUMBER}/user/{USER_API_KEY}/vocabulary/{levels}'
-};
 
 // Some common names for the API Key variable defined some other script authors
-// Define your own if you know of other names
 var commonAPIKeyNames = ['apiKey'];
 
 var hpx, // app-controller
@@ -55,34 +57,54 @@ var hpx, // app-controller
 
 // App controller
 function HPX(){
-    console.log('HPX initializing; Using jQuery version: ' + jQuery.fn.jquery);
+    console.log('HPX initializing; Using jQuery version: ' + jQuery.fn.jquery + '. Caution: minified library may be incomplete');
 
-    var APIKey;
-    var vocabDB; // from APIRequestTemplate.vocabList
-    var requestedLevels;
+    var APIKey,
+        updating = false; // if this instance is updating
 
-    var comparisonVocab;
-    var comparisonReadings = [];
+    var vocabDB, // from API_REQUEST_TEMPLATE.VOCAB_LIST
+        requestedLevels;
 
-    var userInformation;
-    var vocabList;
+    var comparisonVocab,
+        comparisonReadings = [];
+
+    var userInformation,
+        vocabList;
 
     /* eg.,
     [0]{reading: 'あたり', vocabs:[[0]{name:"辺り",meaning:"area"... }]}
      */
     var homophones = [];
 
-    // Setup UI
-    ui = new UI();
+    // Clean up if user navigates away
+    window.onbeforeunload = function(e){
+        if(updating){
+            setUpdatingFlag(false);
+        }
+    };
 
-    // find out the vocab whose reading will be compared to
-    getComparisonVocab();
-
-    // Load previous data if available and display then while we update (if necessary)
+    // Load previous data if available
     loadDataFromLocal();
 
-    // set UI Status to IDLE
-    ui.setStatus('IDLE');
+    // set up to listen for a new comparison vocab
+    $(document).on("HPX:vocabUpdate",function(e,data){
+        if(data && data.exists){
+            comparisonVocab = data.comparisonVocab;
+            createHomophoneList();
+            ui.displayHomophones(homophones);
+        }
+        return false;
+    });
+
+    // Setup UI
+    if($(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/lesson\/session/) === 0 ||
+       $(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/lesson\/session/) === 0){
+        ui = new UISessionPage();
+    } else {
+        ui = new UIPage();
+    }
+
+    ui.setStatus('INIT');
 
     // Let's look for the API Key
     findAPIKey(function(key){
@@ -91,6 +113,8 @@ function HPX(){
             // returned valid key
             APIKey = key;
             autoUpdate(); // only call function once!!
+
+            ui.setStatus('IDLE');
         } else {
             console.log('Cannot find API Key anywhere. Please manually enter your by executing "localStorage.setItem(\''+
                         commonAPIKeyNames[0] +
@@ -107,8 +131,6 @@ function HPX(){
             timeUntilUpdate,
             randomTime;
 
-        ui.setStatus('IDLE');
-
         // add Math.random time to the scheduled update - javascript Chrome and Firefox extensions are probably single threaded but just to make sure
         // this is so that when more than one injected tab is open, they do not all update at the same time
         randomTime = Math.random() * 10000; // U(0,lim->10) seconds
@@ -123,13 +145,13 @@ function HPX(){
         if (pageIsHidden()){
             if(typeof _lastUpdated === 'number'){
                 if(timeSinceUpdate < minUpdateInterval * 60 * 1000 && timeSinceUpdate >= 0){
-                    loadDataFromLocal(); // but do allow it to do a local update
+                    localCreateAndDisplay(); // but do allow it to do a local update
                     console.log('Scheduled autoUpdate in '+Math.floor(timeUntilUpdate/60000)+' minutes, ' + timeUntilUpdate%60000/1000+' seconds.');
                     return setTimeout(function(){autoUpdate();},timeUntilUpdate); // and schedule an autoupdate as if it were an active tab
                 }
             }
-            console.log('Scheduled autoUpdate in 15 seconds.');
-            return setTimeout(function(){autoUpdate();},15000); // try again in 15 seconds
+            console.log('Scheduled autoUpdate in 3 seconds.');
+            return setTimeout(function(){autoUpdate();},3000); // try again in 3 seconds
         }
 
         // else in the active tab, schedule is a server update
@@ -147,7 +169,7 @@ function HPX(){
                     setTimeout(function(){autoUpdate();},timeUntilUpdate);
 
                     // reload from cache because another instance of HPX could have updated the cache
-                    loadDataFromLocal();
+                    localCreateAndDisplay();
                 }
             }
         } else {
@@ -164,16 +186,14 @@ function HPX(){
             if(!isUpdating()){
                 setUpdatingFlag(true);
             }else{
-                // try again in 15 seconds
-                setTimeout(function(){autoUpdate();},15000);
+                // try again in 3 seconds
+                setTimeout(function(){autoUpdate();},3000);
                 ui.setStatus('UPDATING_OTHER_INSTANCE');
-                console.log("Update queued. Retrying in 15 seconds");
+                console.log("Update queued. Retrying in 3 seconds");
                 return;
             }
 
-            console.log('Updating');
             ui.setStatus('UPDATING');
-
 
             loadListFromServer(function(success,data){
 
@@ -183,11 +203,8 @@ function HPX(){
 
                     userInformation = data.user_information;
                     vocabList = data.requested_information;
-                    getComparisonReadings();
-                    createHomophoneList();
 
-                    console.log('Displaying homophones from refresh');
-                    ui.displayHomophones(homophones);
+                    console.log('Updated cache');
 
                     // update lastUpdated
                     lastUpdated = new Date().getTime();
@@ -195,28 +212,38 @@ function HPX(){
                     // schedule next update
                     autoUpdate();
 
+                    ui.setStatus('IDLE');
                 } else {
-                    console.log('Problem connecting to server',data);
+                    console.log(data);
+                    console.log('Problem connecting to server. Retrying in 3 seconds');
+                    // schedule next update in 3 seconds
+                    setTimeout(function(){autoUpdate();},3000);
+
+                    ui.setStatus('CONNECTION_ERROR');
                 }
 
-                ui.setStatus('IDLE');
             });
 
-            // Sets the KEY_NAMES.UPDATING flag in GM_setValue to prevent other HPX instances from updating
-            // bool updating true when updating, else false
-            function setUpdatingFlag(updating){
-                GM_setValue(KEY_NAMES.UPDATING,updating);
-            }
-
         }
 
-        // checks GM_getValue for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
+        // checks sessionStorage for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
         function isUpdating(){
-            var updating = GM_getValue(KEY_NAMES.UPDATING);
-            console.log(typeof updating,(typeof updating !== 'undefined' ? updating:undefined));
-            return (typeof updating !== 'undefined' ? updating:false); // return updating status or false during first run
+            var res = sessionStorage.getItem('HPX');
+            return (res !== null && JSON.parse(res).updating) ? true : false; // return updating status or false during first run
         }
 
+    }
+
+    // Sets HPX.updating flag in sessionStorage to prevent other HPX instances from updating
+    function setUpdatingFlag(_updating){
+        updating = _updating;
+        sessionStorage.setItem('HPX',JSON.stringify({updating:_updating}));
+    }
+
+    function localCreateAndDisplay(){
+        loadDataFromLocal();
+        createHomophoneList();
+        ui.displayHomophones(homophones);
     }
 
     // returns lastUpdated from GM_getValue
@@ -225,25 +252,7 @@ function HPX(){
         return (typeof _lastUpdated !== 'undefined' ? _lastUpdated:undefined); // return time lastUpdated or undefined during first run
     }
 
-    // get the vocab of the current page from url
-    function getComparisonVocab(){
-        var currentUrl = $(location).attr('href');
 
-        // create jQuery object with <a> DOM
-        var a = $('<a>',{href:currentUrl})[0];
-
-        // extract pathname from the url
-        var pathname = a.pathname;
-
-        // at this stage, pathname could be "/vocabulary/{vocab}" or "/vocabulary/{vocab}/" or "/level/[0-9]+/vocabulary/{vocab}" or "/level/[0-9]+/vocabulary/{vocab}/"
-        // remove "/vocabulary/" first then any trailing"/"
-        pathname = pathname.replace(/^.*\/vocabulary\//i,'');
-        pathname = pathname.replace(/\//,'');
-
-        // decode
-        comparisonVocab = decodeURIComponent(pathname);
-        console.log('Comparison vocab detected as ' + comparisonVocab);
-    }
 
     // finds the reading for the current vocab - don't really trust the reading on the page - the layout could've been altered by other scripts
     function getComparisonReadings(){
@@ -260,7 +269,16 @@ function HPX(){
 
     function createHomophoneList(){
 
+        console.log('Creating homophones list using comparator: ' + comparisonVocab);
+
         var currentReadings = [];
+
+        if(typeof comparisonVocab === 'undefined'){
+            homophones = [];
+            return false;
+        }
+
+        getComparisonReadings();
 
         // prepare homophones array
         for (var k = 0; k < comparisonReadings.length; k++){
@@ -314,7 +332,9 @@ function HPX(){
         _lastUpdated = getLastUpdated();
         _data = GM_getValue(KEY_NAMES.DATA);
 
-        if(typeof _data === 'undefined' || typeof _lastUpdated === 'undefined'){
+        /* jshint eqnull:true */
+        if(_data == null || _lastUpdated == null){
+
             return false;
         } else {
 
@@ -322,15 +342,10 @@ function HPX(){
             userInformation = JSON.parse(_data).user_information; // hpx variable
             vocabList = JSON.parse(_data).requested_information; // hpx variable
 
-            // present something to the user first
-            getComparisonReadings();
-            createHomophoneList();
-
-            console.log('Displaying homophones from cache');
-            ui.displayHomophones(homophones);
+            console.log("Loading data from cache");
             return true;
         }
-
+        /* jshint eqnull:false */
     }
 
     // get json using API; also saves it in GM_setValue
@@ -365,14 +380,14 @@ function HPX(){
         while (level <= MAX_LEVEL){
 
             var levels = '';
-            var urlBuild = APIRequestTemplate.vocabList;
+            var urlBuild = API_REQUEST_TEMPLATE.VOCAB_LIST;
 
             // build a levels string for the {levels} part of the request
             // splitting each set into levels_per_set levels
             for (var i = 0; i < levels_per_set && level <= MAX_LEVEL; level++, i++){
                 levels += level;
                 // add a ',' after every level except for the last one
-                if(level !== MAX_LEVEL){
+                if(level !== MAX_LEVEL && i + 1 !== levels_per_set){
                     levels += ',';
                 }
             }
@@ -391,7 +406,7 @@ function HPX(){
                 }).done(function(data,status,xhr){
                     buildList(setID, true, data);
                 }).fail(function(xhr){
-                    buildList(setId, false, data);
+                    buildList(setID, false, xhr);
                 });
             })(setIndex);
 
@@ -403,7 +418,8 @@ function HPX(){
         // calls back when all requests have called back, in success or failure
         // param bool success
         function buildList(setID,success,data){
-            console.log('Data Set "'+setID+'" returned '+success);
+            if(success){console.log('Data Set "'+setID+'" returned '+success);}
+
             responsesReceived++;
 
             if(success){
@@ -473,7 +489,7 @@ function HPX(){
 }
 
 // User interface controller
-function UI(){
+function UIPage(){
 
     var elements = {}; // jQuery object DOM elements
 
@@ -481,8 +497,11 @@ function UI(){
     var timeoutID;
 
     var currentStatus;
-    var statuses = {
-        INIT:'Initiatizing',
+    this.statuses = {
+        INIT:function(){
+            getComparisonVocab();
+            return 'Initiatizing';
+        },
         IDLE:function(){
             var time,days,hours,mins,secs;
             var strTime = 'Last updated: ';
@@ -521,10 +540,13 @@ function UI(){
         },
         SEARCHING_FOR_KEY: 'Looking for your API Key.',
         SEARCH_FOR_KEY_FAILED:'Cannot find your API Key. Please try again later.',
+        CONNECTION_ERROR: function(){
+            setTimeout(function(){this.setStatus('IDLE');},2000); // go back to idle after 2 seconds of displaying error message
+            return 'Connection error... Retrying momentarily';
+        },
         UPDATING: 'Updating cache with Wanikani servers. Please stay on the page...', // API Servers
         UPDATING_OTHER_INSTANCE: 'Updating cache on another instance.'
     };
-
 
     // build UI layout hierarchy
     // using Wanikani's .kotaba-table-list to display the vocab
@@ -542,8 +564,6 @@ function UI(){
 
     // display p when no homophones found
     elements.noHomophones = $('<p>',{text:'No homophones founds'});
-
-    // options row ################################################################
 
     elements.hpxSection
         .append(elements.heading)
@@ -623,35 +643,80 @@ function UI(){
     // public function that allows the view to be set
     // calls updateView() which updates the status text
     this.setStatus = function(state){
-        if(statuses.hasOwnProperty(state)){
+
+        var thisContext = this;
+
+        console.log(state);
+        if(thisContext.statuses.hasOwnProperty(state)){
             currentStatus = state;
             updateView();
         }
 
         function updateView(){
-            if(typeof timeoutID !== 'undefined'){
+            var res;
+
+            if(typeof thisContext.statuses[currentStatus] === 'function'){
+                res = thisContext.statuses[currentStatus]();
+            } else {
+                res = thisContext.statuses[currentStatus];
+            }
+
+            if(typeof timeoutID != 'undefined'){
                 clearTimeout(timeoutID);
-                elements.info.text(statuses[currentStatus]);
+                elements.info.text(res);
             }
             timeoutID = setTimeout(function(){updateView();},1000);
         }
 
     };
 
-    this.setStatus('INIT');
+    // get the vocab of the current page from url
+    function getComparisonVocab(){
+        var comparisonVocab,
+            currentUrl = $(location).attr('href');
+
+        // create jQuery object with <a> DOM
+        var a = $('<a>',{href:currentUrl})[0];
+
+        // extract pathname from the url
+        var pathname = a.pathname;
+
+        // at this stage, pathname could be "/vocabulary/{vocab}" or "/vocabulary/{vocab}/" or "/level/[0-9]+/vocabulary/{vocab}" or "/level/[0-9]+/vocabulary/{vocab}/"
+        // remove "/vocabulary/" first then any trailing"/"
+        pathname = pathname.replace(/^.*\/vocabulary\//i,'');
+        pathname = pathname.replace(/\//,'');
+
+        // decode
+        comparisonVocab = decodeURIComponent(pathname);
+        console.log('Comparison vocab detected as ' + comparisonVocab);
+
+        // trigger new HPX:vocabUpdate event
+        $(document).trigger('HPX:vocabUpdate',{
+            exists: true,
+            comparisonVocab: comparisonVocab
+        });
+    }
+
 }
 
-function UISession(){
+function UISessionPage(){
+
+    var comparisonVocab;
 
     // hook jQuery.fn.show()
-    function hookShow(){
-        $.fn._show_hpx = $.fn.show;
-        $.fn.show = function(a,b,c){
-            res = $.fn._show_hpx.call(this,a,b,c);
+    $.fn._show_hpx = $.fn.show;
+    $.fn.show = function(a,b,c){
+        var res = $.fn._show_hpx.call(this,a,b,c);
 
-            return res;
-        };
-    }
+        // detect when Wanikani has loaded additional item information
+        // ("#all-info").show() seems to correspond with this.
+        // Cannot just hook show() of just one instance as jQuery creates a new jQuery every time it's called and doesn't reuse jQuery objects as I had first thought
+        if(this[0].id === "all-info"){
+
+        }
+
+        return res;
+    };
 }
 
 // Attempts to find API Key in GM_getValue, localStorage and wanikani.com in that order

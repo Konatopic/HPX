@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Homophone Explorer
 // @namespace    com.konatopic.hpx
-// @version      0.7.0b
+// @version      0.8.1b
 // @description  Finds Japanese homophones on each vocabulary page on Wanikani.com
 // @author       Konatopic
 // @grant        GM_setValue
@@ -9,13 +9,11 @@
 // @include      /^http(s)?://www\.wanikani\.com/vocabulary//
 // @include      /^http(s)?://www\.wanikani\.com/level/[0-9]+/vocabulary//
 // @include      /^http(s)?://www\.wanikani\.com/review/session/
+// @include      /^http(s)?://www\.wanikani\.com/lesson/session/
 // ==/UserScript==
 
 // TODOs #########################################################
-// support for lesson pages
-// support for free accounts - check for {error}
-
-// @include      /^http(s)?://www\.wanikani\.com/lesson/session/
+// check for {error}
 
 // =============================== CONSTANTS =================================== //
 var MAX_LEVEL = 60; // as of this version
@@ -43,8 +41,7 @@ var hpx, // app-controller
     ui; // ui-controller
 
 // =============================== FUNCTIONS ==================================== //
-// Wanikani uses jQuery -- might as well take advantage of it
-// Check for it.
+// Wanikani uses jQuery (albeit possibly incomplete) -- might as well take advantage of it
 (function checkJQuery(){
     if(typeof jQuery !== 'undefined') {
         (function(){
@@ -87,7 +84,7 @@ function HPX(){
     // Load previous data if available
     loadDataFromLocal();
 
-    // set up to listener for a new comparison vocab & reload
+    // set up to listener for a new comparison vocab & reload & reloadapi
     $(document).on('HPX:vocabUpdate',function(e,data){
         if(data && data.exists){
             comparisonVocab = data.comparisonVocab;
@@ -102,6 +99,12 @@ function HPX(){
             update(true);
         }
         return false;
+    }).on('HPX:reloadAPIRequest',function(e){
+        findAPIKey(function(key){
+            if(typeof key === 'string'){
+                APIKey = key;
+            }
+        },true);
     });
 
     // Setup UI
@@ -116,18 +119,14 @@ function HPX(){
 
     // Let's look for the API Key
     findAPIKey(function(key){
-        ui.setStatus('SEARCHING_FOR_KEY');
         if(typeof key === 'string'){
             // returned valid key
             APIKey = key;
             autoUpdate(); // only call function once!!
-
-            ui.setStatus('IDLE');
         } else {
             console.log('Cannot find API Key anywhere. Please manually enter your by executing "localStorage.setItem(\''+
                         commonAPIKeyNames[0] +
                         '\', API_KEY);" in your developer console while on any wanikani.com page, where API_KEY is your 32 character API Key. Please report this to the developer.');
-            ui.setStatus('SEARCH_FOR_KEY_FAILED');
         }
     });
 
@@ -548,6 +547,15 @@ function UIPage(){
         SEARCHING_FOR_KEY: 'Looking for your API Key.',
 
         SEARCH_FOR_KEY_FAILED:'Cannot find your API Key. Please try again later.',
+        
+        FOUND_API_KEY:function(){
+            setTimeout(function(){
+                if(currentStatus === 'FOUND_API_KEY'){
+                    this.setStatus('IDLE');
+                }
+            }.bind(this),3000);
+            return 'Retrieved API Key from your account page.';
+        },
 
         CONNECTION_ERROR: function(){ // go back to idle after 2 seconds of displaying error message
             setTimeout(function(){
@@ -577,12 +585,21 @@ function UIPage(){
     elements.info.css('display','inline-block');
 
     // reset button
-
-    elements.reset = $('<a>',{'class':'btn btn-mini'});
-    elements.reset.text('Update cache now');
-    elements.reset.css('float','right');
+    elements.reset = $('<a>',{'class':'btn btn-mini hpx-btn'})
+        .css('margin-left','5px')
+        .css('float','right')
+        .text('Update cache now');
     elements.reset.on('click',function(){
         $(document).trigger('HPX:reloadRequest');
+    });
+
+    // reset API button
+    elements.resetAPI = $('<a>',{'class':'btn btn-mini hpx-btn'})
+        .css('margin-left','5px')
+        .css('float','right')
+        .text('Reload API Key');
+    elements.resetAPI.on('click',function(){
+        $(document).trigger('HPX:reloadAPIRequest');
     });
 
     // ul
@@ -593,7 +610,8 @@ function UIPage(){
 
     elements.infoResetHolder
         .append(elements.info)
-        .append(elements.reset);
+        .append(elements.reset)
+        .append(elements.resetAPI);
 
     elements.hpxSection
         .append(elements.heading)
@@ -729,7 +747,8 @@ function UIPage(){
 
 function UISessionPage(){
 
-    var elements = {}; // jQuery object DOM elements
+    var elements = {}; // jQuery object DOM elements for /review and /lesson
+    var lessonPage = ($(location).attr('href').search(/^http(s)?:\/\/www\.wanikani\.com\/lesson\/session/) === 0) ? true : false;
 
     var currentStatus;
     var statuses = {
@@ -739,6 +758,15 @@ function UISessionPage(){
 
         IDLE:function(){
             return '';
+        },
+
+        FOUND_API_KEY:function(){
+            setTimeout(function(){
+                if(currentStatus === 'FOUND_API_KEY'){
+                    this.setStatus('IDLE');
+                }
+            }.bind(this),3000);
+            return 'Retrieved API Key from your account page.';
         },
 
         SEARCHING_FOR_KEY: 'Looking for your API Key.',
@@ -758,26 +786,18 @@ function UISessionPage(){
         UPDATING_OTHER_INSTANCE: 'Updating cache on another instance.'
     };
 
-    elements.hpxSection = $('<section>',{id:'hpx-ui'});
-
-    // spacer
-    elements.spacer = $('<div>',{html:'&nbsp'});
-
-    // section title/heading
-    elements.heading = $('<h2>',{text:'Homophones'});
-
-    // ul
-    elements.ul = $('<ul>',{'class':'lattice-multi-character'});
-    elements.ul.css('padding-left','0');
-
-    // display p when no homophones found
-    elements.noHomophones = $('<p>',{text:'No homophones founds'});
+    elements.hpxSection = $('<section>',{id:'hpx-ui'})
+        .css('margin-top','21px'); // wrapper
+    elements.heading = $('<h2>',{text:'Homophones'}); // section title/heading
+    elements.ul = $('<ul>',{'class':'lattice-multi-character'}) // ul
+        .css('padding-left','0');
+    elements.noHomophones = $('<p>',{text:'No homophones founds'});// display p when no homophones found
 
     elements.hpxSection
         .append(elements.heading)
         .append(elements.ul);
 
-    // hook jQuery.fn.show()
+    // hook jQuery.fn.show() - for review sections of /lesson and /review
     $.fn._hpx_show = $.fn.show;
     $.fn.show = function(a,b,c){
         var res = $.fn._hpx_show.call(this,a,b,c);
@@ -789,13 +809,31 @@ function UISessionPage(){
 
         } else if(typeof this[0] !== 'undefined' && this[0].id === 'all-info'){
             // wanikani ajax request returns - does not fire with radicals
-            getComparisonVocab();
+            if(lessonPage){
+                getComparisonVocab($.jStorage.get('l/currentQuizItem'));
+            } else {
+                getComparisonVocab($.jStorage.get('currentItem'));
+            }
         } else if (typeof this[0] === 'undefined'){
             console.log(this); // i'm curious
         }
 
         return res;
     };
+
+    if(lessonPage){
+        // hook on to $.jStorage.get function - for lesson the section of /lesson
+        $.jStorage._hpx_get = $.jStorage.get;
+        $.jStorage.get = function( key , defaultValue){
+            var res = $.jStorage._hpx_get( key , defaultValue);
+            if(key === 'l/currentLesson'){
+                if(res.voc){
+                    getComparisonVocab(res);
+                }
+            }
+            return res;
+        };
+    }
 
     // build the list layout
     this.displayHomophones = function(homophones){
@@ -835,8 +873,12 @@ function UISessionPage(){
             }
         }
 
-        $('#item-info-reading')
-            .append(elements.spacer)
+        // don't know if it's a review/quiz or lesson? why not both
+        if(lessonPage){
+            $("#supplement-voc-reading div.col1") // lesson
+                .append(elements.hpxSection);
+        }
+        $('#item-info-reading') // quiz/review
             .append(elements.hpxSection);
 
     };
@@ -859,8 +901,9 @@ function UISessionPage(){
     };
 
     // get the vocab of the current page from url
-    function getComparisonVocab(){
-        var comparisonVocab = $.jStorage.get("currentItem").voc ? $.jStorage.get("currentItem").voc : undefined; // only for vocab
+    // wkObj is a vocab item plain object type. see wanikani.com/api for more info
+    function getComparisonVocab(wkObj){
+        var comparisonVocab = wkObj.voc ? wkObj.voc : undefined; // only for vocab
         console.log('Comparison vocab detected as ' + comparisonVocab);
 
         if(comparisonVocab){
@@ -893,8 +936,10 @@ function findAPIKey(callback,forceRemote){
     var key;
     var keyRegex = /^[0-9a-f]{32}$/i;
 
+    ui.setStatus('SEARCHING_FOR_KEY');
+
     // default value of forceRemote is false
-    if (typeof forceRemote !== 'undefined' || !forceRemote){
+    if (!(typeof forceRemote !== 'undefined' && forceRemote)){
 
         // Look for the key in userscript DB
         key = GM_getValue(KEY_NAMES.API_KEY);
@@ -920,10 +965,12 @@ function findAPIKey(callback,forceRemote){
             if (validKeyFound){
                 console.log('Found key in localStorage: ' + key);
                 saveKey(key);
+                ui.setStatus('IDLE');
                 return callback(key);
             }
         } else {
             console.log('Found key in GM_getValue: ' + key);
+            ui.setStatus('IDLE');
             return callback(key);
         }
     }
@@ -942,14 +989,19 @@ function findAPIKey(callback,forceRemote){
         key = page.find('#api-button').parent().find('input')[0].value;
         if(isValidKey(key)){
             console.log('Found it from AJAX: ' + key);
-
             saveKey(key);
+
+            ui.setStatus('FOUND_API_KEY');
             callback(key);
+
         }
     }).fail( function(xhr){
         // Did not receive successful response
-        console.log(xhr); // RESPOND TO THIS FAILED RESPONSE  #######################################
+        console.log(xhr);
+
+        ui.setStatus('SEARCH_FOR_KEY_FAILED');
         callback(xhr);
+
     });
 
     function saveKey(validKey){

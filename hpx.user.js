@@ -2,7 +2,7 @@
 // @name         Homophone Explorer
 // @namespace    com.konatopic.hpx
 // @version      0.8.1b
-// @description  Finds Japanese homophones on each vocabulary page on Wanikani.com
+// @description  Finds homophones on Wanikani.com on each vocabulary page and during lesson and review sessions.
 // @author       Konatopic
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -13,7 +13,6 @@
 // ==/UserScript==
 
 // TODOs #########################################################
-// check for {error}
 
 // =============================== CONSTANTS =================================== //
 var MAX_LEVEL = 60; // as of this version
@@ -188,7 +187,7 @@ function HPX(){
 
     }
 
-    // checks sessionStorage for KEY_NAMES.UPDATING for updating status. Useful when more than one injected tab is open
+    // checks sessionStorage for updating flag. Useful when more than one injected tab is open
     function isUpdating(){
         var res = sessionStorage.getItem('HPX');
         return (res !== null && JSON.parse(res).updating) ? true : false; // return updating status or false during first run
@@ -280,11 +279,12 @@ function HPX(){
 
         var currentReadings = [];
 
-        if(typeof comparisonVocab === 'undefined'){
+        // check if comparisonVocab exists and vocabList has been defined
+        if(typeof comparisonVocab === 'undefined' || !vocabList){
             homophones = [];
             return false;
         }
-
+        
         getComparisonReadings();
 
         // prepare homophones array
@@ -745,6 +745,7 @@ function UIPage(){
 
 }
 
+// for /lesson/session and /review/session
 function UISessionPage(){
 
     var elements = {}; // jQuery object DOM elements for /review and /lesson
